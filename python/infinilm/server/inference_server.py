@@ -12,6 +12,7 @@ import uvicorn
 import logging
 import os
 import asyncio
+from typing import Optional
 from infinilm.base_config import BaseConfig
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -112,6 +113,8 @@ class InferenceServer:
         ignore_eos: bool = False,
         enable_chunked_prefill: bool = False,
         prefill_chunk_size: int = 512,
+        enable_continuous_batching: bool = False,
+        max_num_batched_tokens: Optional[int] = None,
     ):
         """Initialize inference server.
 
@@ -135,6 +138,8 @@ class InferenceServer:
             attn_backend: Attention backend to use ('default', 'flash-attn').
             enable_chunked_prefill: Whether to split prompt prefill into chunks.
             prefill_chunk_size: Number of prompt tokens per prefill chunk.
+            enable_continuous_batching: Whether to enable continuous batching.
+            max_num_batched_tokens: Maximum scheduled tokens per engine step.
         """
         self.model_path = model_path
         # vLLM-like served model id: directory name of model_path
@@ -158,6 +163,8 @@ class InferenceServer:
         self.ignore_eos = ignore_eos
         self.enable_chunked_prefill = enable_chunked_prefill
         self.prefill_chunk_size = prefill_chunk_size
+        self.enable_continuous_batching = enable_continuous_batching
+        self.max_num_batched_tokens = max_num_batched_tokens
 
         self.engine: AsyncLLMEngine = None
 
@@ -191,6 +198,8 @@ class InferenceServer:
                 attn_backend=self.attn_backend,
                 enable_chunked_prefill=self.enable_chunked_prefill,
                 prefill_chunk_size=self.prefill_chunk_size,
+                enable_continuous_batching=self.enable_continuous_batching,
+                max_num_batched_tokens=self.max_num_batched_tokens,
             )
             self.engine.start()
             logger.info(f"Engine initialized with model at {self.model_path}")
@@ -568,7 +577,7 @@ def main():
         device=device,
         dtype=cfg.dtype,
         tensor_parallel_size=cfg.tp,
-        cache_type="paged" if cfg.enable_paged_attn else "static",
+        cache_type=cfg.cache_type,
         max_tokens=cfg.max_new_tokens,
         max_batch_size=cfg.max_batch_size,
         num_blocks=cfg.num_blocks,
@@ -584,6 +593,8 @@ def main():
         ignore_eos=cfg.ignore_eos,
         enable_chunked_prefill=cfg.enable_chunked_prefill,
         prefill_chunk_size=cfg.prefill_chunk_size,
+        enable_continuous_batching=cfg.enable_continuous_batching,
+        max_num_batched_tokens=cfg.max_num_batched_tokens,
     )
     server.start()
 

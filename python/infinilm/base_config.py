@@ -64,6 +64,9 @@ class BaseConfig:
         self.enable_paged_attn = self.args.enable_paged_attn
         self.enable_chunked_prefill = self.args.enable_chunked_prefill
         self.prefill_chunk_size = self.args.prefill_chunk_size
+        self.enable_continuous_batching = self.args.enable_continuous_batching
+        self.max_num_batched_tokens = self.args.max_num_batched_tokens
+        self.cache_type = "paged" if self.enable_paged_attn else "static"
         self.num_blocks = self.args.num_blocks
         self.block_size = self.args.block_size
         self.max_cache_len = self.args.max_cache_len
@@ -113,12 +116,29 @@ class BaseConfig:
         if self.enable_chunked_prefill:
             if self.cache_type != "paged":
                 raise ValueError(
-                    "--enable-chunked-prefill currently requires --cache-type paged"
+                    "--enable-chunked-prefill currently requires --enable-paged-attn"
                 )
             if self.prefill_chunk_size <= 0:
                 raise ValueError(
                     "--prefill-chunk-size must be greater than 0 when "
                     "--enable-chunked-prefill is set"
+                )
+
+        if (
+            self.max_num_batched_tokens is not None
+            and self.max_num_batched_tokens <= 0
+        ):
+            raise ValueError("--max-num-batched-tokens must be greater than 0")
+
+        if self.enable_continuous_batching:
+            if self.cache_type != "paged":
+                raise ValueError(
+                    "--enable-continuous-batching currently requires --enable-paged-attn"
+                )
+            if not self.enable_chunked_prefill:
+                raise ValueError(
+                    "--enable-continuous-batching currently requires "
+                    "--enable-chunked-prefill"
                 )
 
     def _add_common_args(self):
@@ -150,6 +170,17 @@ class BaseConfig:
             type=int,
             default=512,
             help="number of prompt tokens per chunk when chunked prefill is enabled",
+        )
+        self.parser.add_argument(
+            "--enable-continuous-batching",
+            action="store_true",
+            help="allow the scheduler to mix prefill chunks and decode work",
+        )
+        self.parser.add_argument(
+            "--max-num-batched-tokens",
+            type=int,
+            default=None,
+            help="maximum number of prompt/decode tokens scheduled in one step",
         )
         self.parser.add_argument(
             "--num-blocks", type=int, default=512, help="number of KV cache blocks"

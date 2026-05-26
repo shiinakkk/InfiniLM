@@ -58,6 +58,8 @@ class EngineConfig:
         skip_load: Whether to skip loading model weights (for testing).
         enable_chunked_prefill: Whether to split prompt prefill into chunks.
         prefill_chunk_size: Number of prompt tokens per prefill chunk.
+        enable_continuous_batching: Whether to mix prefill chunks and decode work.
+        max_num_batched_tokens: Maximum scheduled tokens per engine step.
     """
 
     model_path: str
@@ -78,6 +80,8 @@ class EngineConfig:
     skip_load: bool = False
     enable_chunked_prefill: bool = False
     prefill_chunk_size: int = 512
+    enable_continuous_batching: bool = False
+    max_num_batched_tokens: Optional[int] = None
 
 
 class LLMEngine:
@@ -127,6 +131,8 @@ class LLMEngine:
                 block_size=config.block_size,
                 enable_chunked_prefill=config.enable_chunked_prefill,
                 prefill_chunk_size=config.prefill_chunk_size,
+                enable_continuous_batching=config.enable_continuous_batching,
+                max_num_batched_tokens=config.max_num_batched_tokens,
             )
             logger.info(f"Using Paged KV Cache with num_blocks={config.num_blocks}")
         else:
@@ -409,6 +415,8 @@ class LLM:
         skip_load: bool = False,
         enable_chunked_prefill: bool = False,
         prefill_chunk_size: int = 512,
+        enable_continuous_batching: bool = False,
+        max_num_batched_tokens: Optional[int] = None,
     ):
         """Initialize LLM.
 
@@ -430,6 +438,8 @@ class LLM:
             attn_backend: Attention backend to use ('default', 'flash-attn').
             enable_chunked_prefill: Whether to split prompt prefill into chunks.
             prefill_chunk_size: Number of prompt tokens per prefill chunk.
+            enable_continuous_batching: Whether to enable continuous batching.
+            max_num_batched_tokens: Maximum scheduled tokens per engine step.
         """
         config = EngineConfig(
             model_path=model_path,
@@ -450,6 +460,8 @@ class LLM:
             skip_load=skip_load,
             enable_chunked_prefill=enable_chunked_prefill,
             prefill_chunk_size=prefill_chunk_size,
+            enable_continuous_batching=enable_continuous_batching,
+            max_num_batched_tokens=max_num_batched_tokens,
         )
         self.engine = LLMEngine(config)
         self.config = config
@@ -592,6 +604,8 @@ class AsyncLLMEngine:
         attn_backend: str = "default",
         enable_chunked_prefill: bool = False,
         prefill_chunk_size: int = 512,
+        enable_continuous_batching: bool = False,
+        max_num_batched_tokens: Optional[int] = None,
     ):
         """Initialize AsyncLLMEngine.
 
@@ -613,6 +627,8 @@ class AsyncLLMEngine:
             attn_backend: Attention backend to use ('default', 'flash-attn').
             enable_chunked_prefill: Whether to split prompt prefill into chunks.
             prefill_chunk_size: Number of prompt tokens per prefill chunk.
+            enable_continuous_batching: Whether to enable continuous batching.
+            max_num_batched_tokens: Maximum scheduled tokens per engine step.
         """
         config = EngineConfig(
             model_path=model_path,
@@ -632,6 +648,8 @@ class AsyncLLMEngine:
             attn_backend=attn_backend,
             enable_chunked_prefill=enable_chunked_prefill,
             prefill_chunk_size=prefill_chunk_size,
+            enable_continuous_batching=enable_continuous_batching,
+            max_num_batched_tokens=max_num_batched_tokens,
         )
         self.engine = LLMEngine(config)
         self.config = config

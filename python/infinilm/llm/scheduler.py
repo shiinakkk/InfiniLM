@@ -44,12 +44,25 @@ class Scheduler:
         block_size: int = 256,
         enable_chunked_prefill: bool = False,
         prefill_chunk_size: int = 512,
+        enable_continuous_batching: bool = False,
+        max_num_batched_tokens: Optional[int] = None,
     ):
+        if max_num_batched_tokens is not None and max_num_batched_tokens <= 0:
+            raise ValueError("max_num_batched_tokens must be greater than 0")
+        if enable_continuous_batching and not enable_chunked_prefill:
+            raise ValueError(
+                "enable_continuous_batching currently requires enable_chunked_prefill"
+            )
+
         self.waiting_queue = janus.Queue()
         self.running_queue = janus.Queue()
         self.max_batch_size = max_batch_size
         self.enable_chunked_prefill = enable_chunked_prefill
         self.prefill_chunk_size = prefill_chunk_size
+        self.enable_continuous_batching = enable_continuous_batching
+        self.max_num_batched_tokens = max_num_batched_tokens
+        if self.enable_continuous_batching and self.max_num_batched_tokens is None:
+            self.max_num_batched_tokens = self.max_batch_size * self.prefill_chunk_size
 
         self.cache_manager = BlockManager(num_blocks=num_blocks, block_size=block_size)
         self.block_size = block_size
