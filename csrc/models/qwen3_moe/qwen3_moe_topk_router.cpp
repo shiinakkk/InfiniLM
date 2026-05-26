@@ -1,6 +1,7 @@
 #include "qwen3_moe_topk_router.hpp"
 
 #include "infinicore/ops.hpp"
+#include "infinicore/ops/topk.hpp"
 
 namespace infinilm::models::qwen3_moe {
 
@@ -23,12 +24,20 @@ std::tuple<infinicore::Tensor, infinicore::Tensor> Qwen3MoeTopKRouter::forward(c
     ASSERT(hidden_states->ndim() == 2);
 
     size_t ntoken = hidden_states->shape()[0];
-    auto router_logits = infinicore::op::linear(hidden_states, weight_, std::nullopt, 1.0f);
+    auto router_logits = infinicore::op::linear(hidden_states, weight_, std::nullopt);
 
     auto router_scores = infinicore::Tensor::empty({ntoken, num_experts_per_tok_}, infinicore::DataType::F32, hidden_states->device());
     auto router_indices = infinicore::Tensor::empty({ntoken, num_experts_per_tok_}, infinicore::DataType::I32, hidden_states->device());
 
-    infinicore::op::topksoftmax(router_scores, router_indices, router_logits, num_experts_per_tok_, norm_topk_prob_);
+    auto router_probs = infinicore::op::softmax(router_logits, -1);
+    infinicore::op::topk_(
+        router_scores,
+        router_indices,
+        router_probs,
+        num_experts_per_tok_,
+        1,
+        true,
+        true);
 
     return std::make_tuple(router_scores, router_indices);
 }

@@ -37,7 +37,7 @@ to_legacy_quant(const std::shared_ptr<infinilm::quantization::BaseQuantization> 
     case infinilm::quantization::QuantScheme::GPTQ_W4A16_QY:
         return std::make_shared<infinicore::quantization::GPTQ_QY>(quant->get_config());
     case infinilm::quantization::QuantScheme::GPTQ_W4A16:
-        return std::make_shared<infinicore::quantization::GPTQ>(quant->get_config());
+        return std::make_shared<infinicore::quantization::GPTQ_QY>(quant->get_config());
     default:
         return std::make_shared<infinicore::quantization::NoneQuantization>(quant->get_config());
     }

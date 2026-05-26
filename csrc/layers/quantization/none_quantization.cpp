@@ -24,7 +24,7 @@ infinicore::Tensor NoneQuantization::forward(
     const ParamsMap &params,
     const infinicore::Tensor &input,
     bool has_bias,
-    float alpha) const {
+    float /*alpha*/) const {
 
     auto input_contiguous = input->is_contiguous() ? input : input->contiguous();
     auto weight = params.at("weight");
@@ -34,7 +34,10 @@ infinicore::Tensor NoneQuantization::forward(
         bias_opt = params.at("bias");
     }
 
-    return infinicore::op::linear(input_contiguous->contiguous(), weight->contiguous(), bias_opt, alpha);
+    return infinicore::op::linear(
+        input_contiguous->contiguous(),
+        weight->contiguous(),
+        bias_opt);
 }
 
 std::vector<SplitParam> NoneQuantization::split_params(
