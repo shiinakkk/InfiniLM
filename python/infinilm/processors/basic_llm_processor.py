@@ -1,7 +1,12 @@
 from .processor import InfinilmProcessor, register_processor
 from transformers import AutoTokenizer
 from ..llm.static_scheduler import StaticSchedulerOutput
-from ..llm.scheduler import SchedulerOutput
+from ..llm.scheduler import (
+    PHASE_DECODE,
+    PHASE_PREFILL_LAST,
+    PHASE_PREFILL_MIDDLE,
+    SchedulerOutput,
+)
 
 
 @register_processor("default")
@@ -181,12 +186,26 @@ class BasicLLMProcessor(InfinilmProcessor):
         )
         current_offset = 0
 
-        for req in scheduler_output.scheduled_requests:
+        request_phases = getattr(scheduler_output, "request_phases", None)
+        input_ranges = getattr(scheduler_output, "input_ranges", None)
+
+        for req_idx, req in enumerate(scheduler_output.scheduled_requests):
             num_cached = req.num_cached_tokens
-            if scheduler_output.is_prefill:
+            phase = request_phases[req_idx] if request_phases else None
+            input_range = input_ranges[req_idx] if input_ranges else None
+
+            if phase in (PHASE_PREFILL_MIDDLE, PHASE_PREFILL_LAST) or (
+                phase is None and scheduler_output.is_prefill
+            ):
                 # Prefill phase
                 req_tokens = req.get_input_tokens()
-                if getattr(scheduler_output, "use_chunked_prefill", False):
+                if input_range is not None:
+                    chunk_start, chunk_end = input_range
+                    tokens_to_compute = req_tokens[chunk_start:chunk_end]
+                    cached_len = chunk_start
+                    seq_len = chunk_end
+                    position_start = chunk_start
+                elif getattr(scheduler_output, "use_chunked_prefill", False):
                     chunk_start = req.prefill_chunk_start
                     chunk_end = req.prefill_chunk_end
                     tokens_to_compute = req_tokens[chunk_start:chunk_end]
@@ -210,7 +229,7 @@ class BasicLLMProcessor(InfinilmProcessor):
                 cached_lens.append(cached_len)
                 position_ids.extend(range(position_start, position_start + compute_len))
 
-            else:
+            elif phase == PHASE_DECODE or phase is None:
                 # Decode phase
                 seq_len = req.get_total_length()
                 last_token = req.generated_token_ids[-1]
@@ -223,6 +242,8 @@ class BasicLLMProcessor(InfinilmProcessor):
                 slot_mapping.extend(req.slot_mapping)
                 cached_lens.append(num_cached)
                 position_ids.append(seq_len - 1)
+            else:
+                raise ValueError(f"Unsupported request phase: {phase}")
 
             # Pad block_table to same length
             padded_block_table = req.block_table + [-1] * (

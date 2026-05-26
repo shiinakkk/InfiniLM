@@ -23,7 +23,13 @@ from infinilm.llm.request import (
     FinishReason,
 )
 from infinilm.llm.sampling_params import SamplingParams
-from infinilm.llm.scheduler import Scheduler
+from infinilm.llm.scheduler import (
+    PHASE_DECODE,
+    PHASE_PREFILL_LAST,
+    PHASE_PREFILL_MIDDLE,
+    PREFILL_PHASES,
+    Scheduler,
+)
 from infinilm.llm.static_scheduler import StaticScheduler
 from infinilm.processors import AutoInfinilmProcessor
 from infinilm.distributed import DistConfig
@@ -202,8 +208,20 @@ class LLMEngine:
             self.config.top_k,
         )
 
-        # Run inference
-        if getattr(scheduler_output, "use_chunked_prefill", False):
+        # Run inference. Continuous batching uses per-request sampling, where
+        # output_ids is compacted in scheduled request order for sample_mask=True.
+        sample_mask = getattr(scheduler_output, "sample_mask", None)
+        use_per_request_sampling = (
+            getattr(self.scheduler, "enable_continuous_batching", False)
+            and sample_mask is not None
+        )
+        if use_per_request_sampling:
+            sampled_tokens = self.model_engine.forward(
+                **model_input,
+                sample_output=getattr(scheduler_output, "sample_output", True),
+                sample_mask=sample_mask,
+            )
+        elif getattr(scheduler_output, "use_chunked_prefill", False):
             sampled_tokens = self.model_engine.forward(
                 **model_input,
                 sample_output=scheduler_output.sample_output,
@@ -215,26 +233,45 @@ class LLMEngine:
         )
 
         # Update request status
-        pending = self._update_requests(
-            scheduler_output.is_prefill,
-            scheduler_output.scheduled_requests,
-            sampled_tokens_list,
-            scheduler_output.sample_output,
-            scheduler_output.use_chunked_prefill,
-        )
+        pending = self._update_requests(scheduler_output, sampled_tokens_list)
 
         return scheduler_output.scheduled_requests, pending
 
     def _update_requests(
         self,
-        is_prefill: bool,
-        requests: List[InferenceRequest],
+        scheduler_output,
         sampled_tokens: List[int],
-        sample_output: bool = True,
-        use_chunked_prefill: bool = False,
     ) -> List[tuple]:
         """Update request status after inference step."""
-        if is_prefill:
+        requests = scheduler_output.scheduled_requests
+        request_phases = getattr(scheduler_output, "request_phases", None)
+        sample_mask = getattr(scheduler_output, "sample_mask", None)
+        is_prefill = getattr(scheduler_output, "is_prefill", False)
+        sample_output = getattr(scheduler_output, "sample_output", True)
+        use_chunked_prefill = getattr(scheduler_output, "use_chunked_prefill", False)
+
+        if request_phases is None:
+            phase = (
+                PHASE_PREFILL_LAST
+                if is_prefill and sample_output
+                else PHASE_PREFILL_MIDDLE
+                if is_prefill
+                else PHASE_DECODE
+            )
+            request_phases = [phase] * len(requests)
+        if sample_mask is None:
+            sample_mask = [
+                phase in (PHASE_DECODE, PHASE_PREFILL_LAST)
+                for phase in request_phases
+            ]
+
+        if len(request_phases) != len(requests):
+            raise RuntimeError("request phase count does not match request count")
+        if len(sample_mask) != len(requests):
+            raise RuntimeError("sample mask count does not match request count")
+
+        has_prefill = any(phase in PREFILL_PHASES for phase in request_phases)
+        if has_prefill:
             if use_chunked_prefill:
                 if self.cache_type != "paged":
                     raise ValueError("chunked prefill requires paged cache")
@@ -246,19 +283,21 @@ class LLMEngine:
                         self.scheduler.update_cache()
                     case _:
                         raise ValueError(f"Unsupported cache_type: {self.cache_type}")
+
+        expected_sampled_tokens = sum(1 for should_sample in sample_mask if should_sample)
+        if len(sampled_tokens) != expected_sampled_tokens:
+            raise RuntimeError(
+                "sampled token count does not match sample_mask: "
+                f"got {len(sampled_tokens)}, expected {expected_sampled_tokens}"
+            )
+
         pending = []
-        expects_token = (not is_prefill) or sample_output
         sampled_token_iter = iter(sampled_tokens)
 
-        for req in requests:
+        for req, phase, should_sample in zip(requests, request_phases, sample_mask):
             token_id = None
-            if expects_token:
-                try:
-                    token_id = next(sampled_token_iter)
-                except StopIteration as exc:
-                    raise RuntimeError(
-                        "sampled token count is smaller than scheduled request count"
-                    ) from exc
+            if should_sample:
+                token_id = next(sampled_token_iter)
 
             if req.is_aborted():
                 logger.info(
@@ -266,15 +305,16 @@ class LLMEngine:
                 )
                 continue
 
-            if use_chunked_prefill and is_prefill:
+            if use_chunked_prefill and phase in PREFILL_PHASES:
                 req.mark_prefill_progress(req.prefill_chunk_end)
                 self.scheduler.commit_prefill_progress(req)
-                if not sample_output:
-                    continue
-                if req.is_prefill:
+                if phase == PHASE_PREFILL_LAST and req.is_prefill:
                     req.is_prefill = False
-            elif req.is_prefill:
+            elif phase in PREFILL_PHASES and req.is_prefill:
                 req.is_prefill = False
+
+            if not should_sample:
+                continue
 
             if token_id is None:
                 raise RuntimeError("sampled token is required for request update")

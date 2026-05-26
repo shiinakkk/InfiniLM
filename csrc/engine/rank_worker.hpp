@@ -65,6 +65,10 @@ public:
 
         bool sample_output{true};
 
+        std::vector<bool> sample_mask;
+
+        bool has_sample_mask{false};
+
         infinilm::InfinilmModel::Input to_model_input(infinicore::Device device) const;
     };
 

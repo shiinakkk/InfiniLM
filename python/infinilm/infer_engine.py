@@ -139,6 +139,7 @@ class InferEngine(_infinilm.InferEngine):
         top_k=None,
         top_p=None,
         sample_output=True,
+        sample_mask=None,
     ):
         try:
             # TODO: Remove `_underlying` and simplify the corresponding code.
@@ -168,25 +169,31 @@ class InferEngine(_infinilm.InferEngine):
             image_bound = image_bound._underlying if image_bound is not None else None
             tgt_sizes = tgt_sizes._underlying if tgt_sizes is not None else None
 
+            input_kwargs = {
+                "pixel_values": pixel_values,
+                "position_ids": position_ids,
+                "past_sequence_lengths": past_kv_lengths,
+                "total_sequence_lengths": total_kv_lengths,
+                "input_offsets": input_offsets,
+                "cu_seqlens": cu_seqlens,
+                "block_tables": block_tables,
+                "slot_mapping": slot_mapping,
+                "image_bound": image_bound,
+                "tgt_sizes": tgt_sizes,
+                "temperature": temperature,
+                "top_k": top_k,
+                "top_p": top_p,
+                "sample_output": sample_output,
+            }
+            if sample_mask is not None:
+                input_kwargs["sample_mask"] = list(sample_mask)
+
             return infinicore.Tensor(
                 super()
                 .forward(
                     super().Input(
                         input_ids,
-                        pixel_values=pixel_values,
-                        position_ids=position_ids,
-                        past_sequence_lengths=past_kv_lengths,
-                        total_sequence_lengths=total_kv_lengths,
-                        input_offsets=input_offsets,
-                        cu_seqlens=cu_seqlens,
-                        block_tables=block_tables,
-                        slot_mapping=slot_mapping,
-                        image_bound=image_bound,
-                        tgt_sizes=tgt_sizes,
-                        temperature=temperature,
-                        top_k=top_k,
-                        top_p=top_p,
-                        sample_output=sample_output,
+                        **input_kwargs,
                     )
                 )
                 .output_ids

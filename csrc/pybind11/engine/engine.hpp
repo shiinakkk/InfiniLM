@@ -111,6 +111,7 @@ inline void bind_infer_engine(py::module &m) {
                 input.top_p = 1.0f;
                 input.top_k = 1;
                 input.sample_output = true;
+                input.has_sample_mask = false;
 
                 // Allowed keyword arguments
                 static const std::unordered_set<std::string> allowed_kwargs = {
@@ -118,6 +119,7 @@ inline void bind_infer_engine(py::module &m) {
                     "top_p",
                     "top_k",
                     "sample_output",
+                    "sample_mask",
                 };
 
                 for (auto &item : kwargs) {
@@ -136,6 +138,11 @@ inline void bind_infer_engine(py::module &m) {
                         input.top_k = py::cast<int>(item.second);
                     } else if (key == "sample_output") {
                         input.sample_output = py::cast<bool>(item.second);
+                    } else if (key == "sample_mask") {
+                        if (!item.second.is_none()) {
+                            input.sample_mask = py::cast<std::vector<bool>>(item.second);
+                            input.has_sample_mask = true;
+                        }
                     }
                 }
 
@@ -166,7 +173,9 @@ inline void bind_infer_engine(py::module &m) {
         .def_readwrite("temperature", &InferEngine::Input::temperature)
         .def_readwrite("top_k", &InferEngine::Input::top_k)
         .def_readwrite("top_p", &InferEngine::Input::top_p)
-        .def_readwrite("sample_output", &InferEngine::Input::sample_output);
+        .def_readwrite("sample_output", &InferEngine::Input::sample_output)
+        .def_readwrite("sample_mask", &InferEngine::Input::sample_mask)
+        .def_readwrite("has_sample_mask", &InferEngine::Input::has_sample_mask);
 
     py::class_<InferEngine::Output>(infer_engine, "Output")
         .def_readwrite("output_ids", &InferEngine::Output::output_ids, "Output tensor");

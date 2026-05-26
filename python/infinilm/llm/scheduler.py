@@ -11,6 +11,11 @@ from infinilm.llm.cache_manager import BlockManager
 
 logger = logging.getLogger(__name__)
 
+PHASE_DECODE = "decode"
+PHASE_PREFILL_MIDDLE = "prefill_middle"
+PHASE_PREFILL_LAST = "prefill_last"
+PREFILL_PHASES = {PHASE_PREFILL_MIDDLE, PHASE_PREFILL_LAST}
+
 
 class SchedulerOutput:
     """Scheduler output containing scheduled requests and execution phase info."""
@@ -21,12 +26,43 @@ class SchedulerOutput:
         is_prefill: bool = False,
         sample_output: bool = True,
         use_chunked_prefill: bool = False,
+        request_phases: Optional[List[str]] = None,
+        sample_mask: Optional[List[bool]] = None,
+        input_ranges: Optional[List[Optional[tuple[int, int]]]] = None,
     ):
         self.scheduled_requests = scheduled_requests
         self.num_requests = len(scheduled_requests)
         self.is_prefill = is_prefill
         self.sample_output = sample_output
         self.use_chunked_prefill = use_chunked_prefill
+        if request_phases is None:
+            phase = (
+                PHASE_PREFILL_LAST
+                if is_prefill and sample_output
+                else PHASE_PREFILL_MIDDLE
+                if is_prefill
+                else PHASE_DECODE
+            )
+            request_phases = [phase] * self.num_requests
+        if sample_mask is None:
+            sample_mask = [
+                phase in (PHASE_DECODE, PHASE_PREFILL_LAST)
+                for phase in request_phases
+            ]
+        if input_ranges is None:
+            input_ranges = [None] * self.num_requests
+
+        if len(request_phases) != self.num_requests:
+            raise ValueError("request_phases length must match scheduled_requests")
+        if len(sample_mask) != self.num_requests:
+            raise ValueError("sample_mask length must match scheduled_requests")
+        if len(input_ranges) != self.num_requests:
+            raise ValueError("input_ranges length must match scheduled_requests")
+
+        self.request_phases = request_phases
+        self.sample_mask = sample_mask
+        self.input_ranges = input_ranges
+
 
 class Scheduler:
     """Request scheduler with integrated BlockManager for KV cache management.
@@ -74,9 +110,15 @@ class Scheduler:
 
     def schedule(self) -> Optional[SchedulerOutput]:
         """Schedule and return batch of requests to execute."""
+        if self.enable_continuous_batching:
+            return self._schedule_continuous()
+
         scheduled_requests = []
         is_prefill = False
         sample_output = True
+        request_phases = []
+        sample_mask = []
+        input_ranges = []
 
         # Process Waiting queue (prefill phase)
         while len(scheduled_requests) < self.max_batch_size:
@@ -106,6 +148,14 @@ class Scheduler:
                     break
                 sample_output = req_sample_output
                 self._prepare_chunked_prefill_request(req)
+                phase = (
+                    PHASE_PREFILL_LAST
+                    if req.should_sample_current_step()
+                    else PHASE_PREFILL_MIDDLE
+                )
+                request_phases.append(phase)
+                sample_mask.append(req.should_sample_current_step())
+                input_ranges.append((req.prefill_chunk_start, req.prefill_chunk_end))
             else:
                 req_tokens = req.get_input_tokens()
                 num_required_blocks = req.get_num_blocks_required(self.block_size)
@@ -118,6 +168,9 @@ class Scheduler:
                 req.block_table, req.slot_mapping, req.num_cached_tokens = (
                     self.cache_manager.allocate_blocks(req_tokens, req.block_table)
                 )
+                request_phases.append(PHASE_PREFILL_LAST)
+                sample_mask.append(True)
+                input_ranges.append((req.num_cached_tokens, len(req_tokens)))
 
             req.num_blocks = len(req.block_table)
             req.status = RequestStatus.RUNNING
@@ -131,6 +184,9 @@ class Scheduler:
                 is_prefill=is_prefill,
                 sample_output=sample_output,
                 use_chunked_prefill=self.enable_chunked_prefill,
+                request_phases=request_phases,
+                sample_mask=sample_mask,
+                input_ranges=input_ranges,
             )
 
         # Process prefill continuations before decode. Step 1 keeps prefill and decode
@@ -161,6 +217,14 @@ class Scheduler:
                 self._prepare_chunked_prefill_request(req)
                 req.status = RequestStatus.RUNNING
                 scheduled_requests.append(req)
+                phase = (
+                    PHASE_PREFILL_LAST
+                    if req.should_sample_current_step()
+                    else PHASE_PREFILL_MIDDLE
+                )
+                request_phases.append(phase)
+                sample_mask.append(req.should_sample_current_step())
+                input_ranges.append((req.prefill_chunk_start, req.prefill_chunk_end))
 
             if scheduled_requests:
                 is_prefill = True
@@ -169,6 +233,9 @@ class Scheduler:
                     is_prefill=is_prefill,
                     sample_output=sample_output,
                     use_chunked_prefill=True,
+                    request_phases=request_phases,
+                    sample_mask=sample_mask,
+                    input_ranges=input_ranges,
                 )
 
         # Process Running queue (decode phase)
@@ -191,6 +258,9 @@ class Scheduler:
                 req.num_blocks = len(req.block_table)
                 req.num_cached_tokens = req.get_total_length() - 1
                 scheduled_requests.append(req)
+                request_phases.append(PHASE_DECODE)
+                sample_mask.append(True)
+                input_ranges.append(None)
 
             except RuntimeError as e:
                 raise RuntimeError("No available cache blocks for new token") from e
@@ -203,9 +273,224 @@ class Scheduler:
                 is_prefill=is_prefill,
                 sample_output=True,
                 use_chunked_prefill=False,
+                request_phases=request_phases,
+                sample_mask=sample_mask,
+                input_ranges=input_ranges,
             )
 
         return None
+
+    def _schedule_continuous(self) -> Optional[SchedulerOutput]:
+        """Schedule a mixed decode/prefill batch for continuous batching."""
+        scheduled_requests: List[InferenceRequest] = []
+        request_phases: List[str] = []
+        sample_mask: List[bool] = []
+        input_ranges: List[Optional[tuple[int, int]]] = []
+        used_tokens = 0
+
+        used_tokens = self._schedule_decode_requests(
+            scheduled_requests,
+            request_phases,
+            sample_mask,
+            input_ranges,
+            used_tokens,
+        )
+        used_tokens = self._schedule_running_prefill_requests(
+            scheduled_requests,
+            request_phases,
+            sample_mask,
+            input_ranges,
+            used_tokens,
+        )
+        self._schedule_waiting_prefill_requests(
+            scheduled_requests,
+            request_phases,
+            sample_mask,
+            input_ranges,
+            used_tokens,
+        )
+
+        if not scheduled_requests:
+            return None
+
+        return SchedulerOutput(
+            scheduled_requests=scheduled_requests,
+            is_prefill=all(phase in PREFILL_PHASES for phase in request_phases),
+            sample_output=any(sample_mask),
+            use_chunked_prefill=True,
+            request_phases=request_phases,
+            sample_mask=sample_mask,
+            input_ranges=input_ranges,
+        )
+
+    def _schedule_decode_requests(
+        self,
+        scheduled_requests: List[InferenceRequest],
+        request_phases: List[str],
+        sample_mask: List[bool],
+        input_ranges: List[Optional[tuple[int, int]]],
+        used_tokens: int,
+    ) -> int:
+        running_queue_size = self.running_queue.sync_q.qsize()
+        for _ in range(running_queue_size):
+            if self._batch_is_full(scheduled_requests):
+                break
+            if not self._fits_token_budget(1, used_tokens, bool(scheduled_requests)):
+                break
+
+            try:
+                req = self.running_queue.sync_q.get_nowait()
+            except queue.Empty:
+                break
+
+            if req.is_finished():
+                self.complete_requests([req])
+                continue
+
+            if req.is_prefill:
+                self.running_queue.sync_q.put(req)
+                continue
+
+            try:
+                req.block_table, new_slot = self.cache_manager.append_slot(
+                    req.block_table, req.get_total_length(), req.get_all_token_ids()
+                )
+            except RuntimeError as e:
+                raise RuntimeError("No available cache blocks for new token") from e
+
+            req.slot_mapping = [new_slot]
+            req.num_blocks = len(req.block_table)
+            req.num_cached_tokens = req.get_total_length() - 1
+            req.status = RequestStatus.RUNNING
+
+            scheduled_requests.append(req)
+            request_phases.append(PHASE_DECODE)
+            sample_mask.append(True)
+            input_ranges.append(None)
+            used_tokens += 1
+
+        return used_tokens
+
+    def _schedule_running_prefill_requests(
+        self,
+        scheduled_requests: List[InferenceRequest],
+        request_phases: List[str],
+        sample_mask: List[bool],
+        input_ranges: List[Optional[tuple[int, int]]],
+        used_tokens: int,
+    ) -> int:
+        running_queue_size = self.running_queue.sync_q.qsize()
+        for _ in range(running_queue_size):
+            if self._batch_is_full(scheduled_requests):
+                break
+
+            remaining_budget = self._remaining_token_budget(used_tokens)
+            if remaining_budget is not None and remaining_budget <= 0:
+                break
+
+            try:
+                req = self.running_queue.sync_q.get_nowait()
+            except queue.Empty:
+                break
+
+            if req.is_finished():
+                self.complete_requests([req])
+                continue
+
+            if not req.is_prefill:
+                self.running_queue.sync_q.put(req)
+                continue
+
+            chunk_len = self._prepare_chunked_prefill_request(
+                req, max_chunk_tokens=remaining_budget
+            )
+            if chunk_len <= 0:
+                self.running_queue.sync_q.put(req)
+                break
+
+            req.status = RequestStatus.RUNNING
+            scheduled_requests.append(req)
+            phase = (
+                PHASE_PREFILL_LAST
+                if req.should_sample_current_step()
+                else PHASE_PREFILL_MIDDLE
+            )
+            request_phases.append(phase)
+            sample_mask.append(req.should_sample_current_step())
+            input_ranges.append((req.prefill_chunk_start, req.prefill_chunk_end))
+            used_tokens += chunk_len
+
+        return used_tokens
+
+    def _schedule_waiting_prefill_requests(
+        self,
+        scheduled_requests: List[InferenceRequest],
+        request_phases: List[str],
+        sample_mask: List[bool],
+        input_ranges: List[Optional[tuple[int, int]]],
+        used_tokens: int,
+    ) -> int:
+        while not self._batch_is_full(scheduled_requests):
+            remaining_budget = self._remaining_token_budget(used_tokens)
+            if remaining_budget is not None and remaining_budget <= 0:
+                break
+
+            try:
+                req = self.waiting_queue.sync_q.get_nowait()
+            except queue.Empty:
+                break
+
+            if req.is_finished():
+                self.complete_requests([req])
+                continue
+
+            if not self.can_accept_request(
+                req, additional_requests=scheduled_requests
+            ):
+                self.waiting_queue.sync_q.put(req)
+                break
+
+            self._initialize_chunked_prefill_cache(req)
+            chunk_len = self._prepare_chunked_prefill_request(
+                req, max_chunk_tokens=remaining_budget
+            )
+            if chunk_len <= 0:
+                self.waiting_queue.sync_q.put(req)
+                break
+
+            req.status = RequestStatus.RUNNING
+            scheduled_requests.append(req)
+            phase = (
+                PHASE_PREFILL_LAST
+                if req.should_sample_current_step()
+                else PHASE_PREFILL_MIDDLE
+            )
+            request_phases.append(phase)
+            sample_mask.append(req.should_sample_current_step())
+            input_ranges.append((req.prefill_chunk_start, req.prefill_chunk_end))
+            used_tokens += chunk_len
+
+        return used_tokens
+
+    def _batch_is_full(self, scheduled_requests: List[InferenceRequest]) -> bool:
+        return len(scheduled_requests) >= self.max_batch_size
+
+    def _remaining_token_budget(self, used_tokens: int) -> Optional[int]:
+        if self.max_num_batched_tokens is None:
+            return None
+        return self.max_num_batched_tokens - used_tokens
+
+    def _fits_token_budget(
+        self,
+        num_tokens: int,
+        used_tokens: int,
+        has_scheduled_requests: bool,
+    ) -> bool:
+        if self.max_num_batched_tokens is None:
+            return True
+        if num_tokens <= self.max_num_batched_tokens - used_tokens:
+            return True
+        return not has_scheduled_requests and num_tokens <= self.max_num_batched_tokens
 
     def _initialize_chunked_prefill_cache(self, req: InferenceRequest) -> None:
         """Attach committed prefix-cache blocks before the first chunk."""
@@ -238,22 +523,45 @@ class Scheduler:
             len(block_table),
         )
 
-    def _chunked_prefill_needs_sampling(self, req: InferenceRequest) -> bool:
+    def _chunked_prefill_needs_sampling(
+        self,
+        req: InferenceRequest,
+        max_chunk_tokens: Optional[int] = None,
+    ) -> bool:
         if self.prefill_chunk_size <= 0:
             raise ValueError("prefill_chunk_size must be greater than 0")
 
+        chunk_size = self.prefill_chunk_size
+        if max_chunk_tokens is not None:
+            chunk_size = min(chunk_size, max_chunk_tokens)
+        if chunk_size <= 0:
+            return False
+
         end = min(
-            req.num_prompt_tokens_computed + self.prefill_chunk_size,
+            req.num_prompt_tokens_computed + chunk_size,
             req.prompt_length,
         )
         return end == req.prompt_length
 
-    def _prepare_chunked_prefill_request(self, req: InferenceRequest) -> bool:
+    def _prepare_chunked_prefill_request(
+        self,
+        req: InferenceRequest,
+        max_chunk_tokens: Optional[int] = None,
+    ) -> int:
         if self.prefill_chunk_size <= 0:
             raise ValueError("prefill_chunk_size must be greater than 0")
 
+        chunk_size = self.prefill_chunk_size
+        if max_chunk_tokens is not None:
+            chunk_size = min(chunk_size, max_chunk_tokens)
+        if chunk_size <= 0:
+            return 0
+
         start = req.num_prompt_tokens_computed
-        end = min(start + self.prefill_chunk_size, req.prompt_length)
+        end = min(start + chunk_size, req.prompt_length)
+        if end <= start:
+            return 0
+
         req.mark_prefill_chunk(start, end)
         logger.info(
             "chunked prefill request=%s chunk=[%d,%d) sample_output=%s",
@@ -267,7 +575,7 @@ class Scheduler:
         )
         req.num_cached_tokens = start
         req.num_blocks = len(req.block_table)
-        return req.should_sample_current_step()
+        return end - start
 
     def commit_prefill_progress(self, req: InferenceRequest) -> None:
         """Commit full prompt blocks after a chunked prefill forward succeeds."""
@@ -326,8 +634,24 @@ class Scheduler:
                 # Still running, put back in running queue
                 self.running_queue.sync_q.put(req)
 
-    def can_accept_request(self, request: InferenceRequest) -> bool:
+    def can_accept_request(
+        self,
+        request: InferenceRequest,
+        additional_requests: Optional[List[InferenceRequest]] = None,
+    ) -> bool:
         total_required_blocks = 0
+
+        additional_requests = additional_requests or []
+        for req in additional_requests:
+            if req.is_finished():
+                continue
+            remaining_tokens = (
+                req.sampling_params.max_tokens - req.get_num_generated_tokens()
+            )
+            num_blocks_needed = (
+                remaining_tokens + self.block_size - 1
+            ) // self.block_size
+            total_required_blocks += num_blocks_needed
 
         # Calculate blocks needed for running requests
         running_queue_size = self.running_queue.sync_q.qsize()
