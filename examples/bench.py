@@ -248,7 +248,7 @@ class TestModel:
         numpy_output_ids = np.array(
             [output_id.to_numpy()[0] for output_id in output_ids]
         )
-        print(self.tokenizer.decode(numpy_output_ids, skip_special_tokens=True))
+        # print(self.tokenizer.decode(numpy_output_ids, skip_special_tokens=True))
 
         print(
             f"total_time: {round((t2 - t1) * 1000, 2)} ms",

@@ -110,6 +110,8 @@ class InferenceServer:
         enable_graph: bool = False,
         attn_backend: str = "default",
         ignore_eos: bool = False,
+        enable_chunked_prefill: bool = False,
+        prefill_chunk_size: int = 512,
     ):
         """Initialize inference server.
 
@@ -131,6 +133,8 @@ class InferenceServer:
             port: Server port number.
             enable_graph: Whether to enable graph compiling.
             attn_backend: Attention backend to use ('default', 'flash-attn').
+            enable_chunked_prefill: Whether to split prompt prefill into chunks.
+            prefill_chunk_size: Number of prompt tokens per prefill chunk.
         """
         self.model_path = model_path
         # vLLM-like served model id: directory name of model_path
@@ -152,6 +156,8 @@ class InferenceServer:
         self.enable_graph = enable_graph
         self.attn_backend = attn_backend
         self.ignore_eos = ignore_eos
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self.prefill_chunk_size = prefill_chunk_size
 
         self.engine: AsyncLLMEngine = None
 
@@ -183,6 +189,8 @@ class InferenceServer:
                 top_k=self.top_k,
                 enable_graph=self.enable_graph,
                 attn_backend=self.attn_backend,
+                enable_chunked_prefill=self.enable_chunked_prefill,
+                prefill_chunk_size=self.prefill_chunk_size,
             )
             self.engine.start()
             logger.info(f"Engine initialized with model at {self.model_path}")
@@ -574,6 +582,8 @@ def main():
         enable_graph=cfg.enable_graph,
         attn_backend=cfg.attn,
         ignore_eos=cfg.ignore_eos,
+        enable_chunked_prefill=cfg.enable_chunked_prefill,
+        prefill_chunk_size=cfg.prefill_chunk_size,
     )
     server.start()
 

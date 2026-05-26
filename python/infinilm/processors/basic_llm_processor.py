@@ -186,19 +186,29 @@ class BasicLLMProcessor(InfinilmProcessor):
             if scheduler_output.is_prefill:
                 # Prefill phase
                 req_tokens = req.get_input_tokens()
-                tokens_to_compute = req_tokens[num_cached:]
+                if getattr(scheduler_output, "use_chunked_prefill", False):
+                    chunk_start = req.prefill_chunk_start
+                    chunk_end = req.prefill_chunk_end
+                    tokens_to_compute = req_tokens[chunk_start:chunk_end]
+                    cached_len = chunk_start
+                    seq_len = chunk_end
+                    position_start = chunk_start
+                else:
+                    tokens_to_compute = req_tokens[num_cached:]
+                    cached_len = num_cached
+                    seq_len = len(req_tokens)
+                    position_start = num_cached
                 tokens.extend(tokens_to_compute)
 
                 compute_len = len(tokens_to_compute)
-                seq_len = len(req_tokens)
                 seq_lens.append(seq_len)
 
                 current_offset += compute_len
                 seq_offsets.append(current_offset)
 
                 slot_mapping.extend(req.slot_mapping)
-                cached_lens.append(num_cached)
-                position_ids.extend(range(num_cached, num_cached + compute_len))
+                cached_lens.append(cached_len)
+                position_ids.extend(range(position_start, position_start + compute_len))
 
             else:
                 # Decode phase

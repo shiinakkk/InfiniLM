@@ -362,29 +362,34 @@ void RankWorker::thread_loop() {
 
                         // Random sampling (rank 0 only)
                         if (rank_info_.tp_rank == 0) {
-                            auto temperature{local_args.temperature};
-                            auto top_p{local_args.top_p};
-                            auto top_k{local_args.top_k};
+                            infinicore::Tensor output_ids;
+                            if (!local_args.sample_output) {
+                                output_ids = infinicore::Tensor::empty({0}, infinicore::DataType::I64, infinicore::Device::cpu());
+                            } else {
+                                auto temperature{local_args.temperature};
+                                auto top_p{local_args.top_p};
+                                auto top_k{local_args.top_k};
 
-                            const auto &logits_shape{logits->shape()};
-                            const auto &vocab_size{logits_shape[2]};
-                            const auto &total_len{logits_shape[1]};
-                            const auto &batch_size{logits_shape[0]};
+                                const auto &logits_shape{logits->shape()};
+                                const auto &vocab_size{logits_shape[2]};
+                                const auto &total_len{logits_shape[1]};
+                                const auto &batch_size{logits_shape[0]};
 
-                            auto n_req = local_args.input_offsets.value()->size(0) - 1;
-                            int32_t *input_offsets = (int32_t *)local_args.input_offsets.value()->data();
+                                auto n_req = local_args.input_offsets.value()->size(0) - 1;
+                                int32_t *input_offsets = (int32_t *)local_args.input_offsets.value()->data();
 
-                            auto output_ids{infinicore::Tensor::empty({n_req}, infinicore::DataType::I64, rank_info_.device)};
+                                output_ids = infinicore::Tensor::empty({n_req}, infinicore::DataType::I64, rank_info_.device);
 
-                            for (auto i{decltype(n_req)(0)}; i < n_req; ++i) {
-                                auto score{logits->view({batch_size * total_len, vocab_size})->narrow({{0, size_t(input_offsets[i + 1] - 1), 1}})->view({vocab_size})};
-                                auto out{output_ids->narrow({{0, i, 1}})->view({})};
-                                float random_val = std::uniform_real_distribution<float>(0, 1)(rng_);
-                                infinicore::op::random_sample_(
-                                    out, score, random_val, top_p, top_k, temperature);
+                                for (auto i{decltype(n_req)(0)}; i < n_req; ++i) {
+                                    auto score{logits->view({batch_size * total_len, vocab_size})->narrow({{0, size_t(input_offsets[i + 1] - 1), 1}})->view({vocab_size})};
+                                    auto out{output_ids->narrow({{0, i, 1}})->view({})};
+                                    float random_val = std::uniform_real_distribution<float>(0, 1)(rng_);
+                                    infinicore::op::random_sample_(
+                                        out, score, random_val, top_p, top_k, temperature);
+                                }
+
+                                output_ids = output_ids->to(infinicore::Device::cpu());
                             }
-
-                            output_ids = output_ids->to(infinicore::Device::cpu());
 
                             infinicore::context::syncStream();
 

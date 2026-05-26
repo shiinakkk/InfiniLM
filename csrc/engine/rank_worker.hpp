@@ -63,6 +63,8 @@ public:
 
         float top_p{1};
 
+        bool sample_output{true};
+
         infinilm::InfinilmModel::Input to_model_input(infinicore::Device device) const;
     };
 

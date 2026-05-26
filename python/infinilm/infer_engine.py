@@ -138,6 +138,7 @@ class InferEngine(_infinilm.InferEngine):
         temperature=None,
         top_k=None,
         top_p=None,
+        sample_output=True,
     ):
         try:
             # TODO: Remove `_underlying` and simplify the corresponding code.
@@ -185,6 +186,7 @@ class InferEngine(_infinilm.InferEngine):
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
+                        sample_output=sample_output,
                     )
                 )
                 .output_ids

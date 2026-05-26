@@ -134,6 +134,13 @@ class InferenceRequest:
         self.generated_text: str = ""
         self.is_prefill: bool = True
         self.status: RequestStatus = RequestStatus.WAITING
+        self.num_prompt_tokens_computed: int = 0
+        self.prefill_chunk_start: int = 0
+        self.prefill_chunk_end: int = 0
+        self.prefill_done: bool = self.prompt_length == 0
+        self.needs_sampling: bool = True
+        self.num_prompt_tokens_committed: int = 0
+        self.last_committed_block_hash: int = -1
         self.finish_reason: Optional[FinishReason] = None
         self.priority: int = 0
 
@@ -172,6 +179,98 @@ class InferenceRequest:
 
     def get_num_generated_tokens(self) -> int:
         return len(self.generated_token_ids)
+
+    def get_num_prompt_tokens_remaining(self) -> int:
+        """Return prompt tokens that still need prefill computation."""
+        return max(self.prompt_length - self.num_prompt_tokens_computed, 0)
+
+    def get_num_prompt_tokens_uncommitted(self) -> int:
+        """Return computed prompt tokens that have not entered prefix cache."""
+        return max(
+            self.num_prompt_tokens_computed - self.num_prompt_tokens_committed,
+            0,
+        )
+
+    def get_prefill_chunk_tokens(self) -> List[int]:
+        """Return token IDs for the currently scheduled prefill chunk."""
+        return self.prompt_token_ids[self.prefill_chunk_start : self.prefill_chunk_end]
+
+    def mark_prefill_chunk(
+        self,
+        start: int,
+        end: int,
+        needs_sampling: Optional[bool] = None,
+    ) -> None:
+        """Record the prompt token range scheduled for the next prefill step."""
+        if start < 0:
+            raise ValueError("prefill chunk start must be non-negative")
+        if end < start:
+            raise ValueError("prefill chunk end must be greater than or equal to start")
+        if end > self.prompt_length:
+            raise ValueError("prefill chunk end cannot exceed prompt length")
+        if start < self.num_prompt_tokens_computed:
+            raise ValueError(
+                "prefill chunk start cannot be before computed prompt progress"
+            )
+
+        self.prefill_chunk_start = start
+        self.prefill_chunk_end = end
+        self.needs_sampling = (
+            end == self.prompt_length if needs_sampling is None else needs_sampling
+        )
+
+    def mark_prefill_progress(self, end: int) -> None:
+        """Advance prompt prefill progress after a chunk has been computed."""
+        if end < self.num_prompt_tokens_computed:
+            raise ValueError("prefill progress cannot move backwards")
+        if end > self.prompt_length:
+            raise ValueError("prefill progress cannot exceed prompt length")
+
+        self.num_prompt_tokens_computed = end
+        self.prefill_done = end == self.prompt_length
+
+    def mark_prefill_committed(
+        self,
+        end: int,
+        prefix_hash: Optional[int] = None,
+        block_size: Optional[int] = None,
+    ) -> None:
+        """Advance prefix-cache commit progress for computed prompt tokens."""
+        if end < self.num_prompt_tokens_committed:
+            raise ValueError("prefill commit progress cannot move backwards")
+        if end > self.num_prompt_tokens_computed:
+            raise ValueError("prefill commit progress cannot exceed computed progress")
+        if end > self.prompt_length:
+            raise ValueError("prefill commit progress cannot exceed prompt length")
+        if block_size is not None and end % block_size != 0:
+            raise ValueError("prefill commit progress must stop on a block boundary")
+
+        self.num_prompt_tokens_committed = end
+        if prefix_hash is not None:
+            self.last_committed_block_hash = prefix_hash
+
+    def validate_prefill_cache_progress(
+        self, block_size: Optional[int] = None
+    ) -> None:
+        """Validate computed and committed prompt cache progress invariants."""
+        if not (
+            0
+            <= self.num_prompt_tokens_committed
+            <= self.num_prompt_tokens_computed
+            <= self.prompt_length
+        ):
+            raise ValueError("invalid prefill cache progress ordering")
+        if (
+            block_size is not None
+            and self.num_prompt_tokens_committed % block_size != 0
+        ):
+            raise ValueError("committed prompt progress must align to block boundary")
+
+    def is_prefill_complete(self) -> bool:
+        return self.prefill_done
+
+    def should_sample_current_step(self) -> bool:
+        return self.needs_sampling
 
     def get_total_length(self) -> int:
         return self.prompt_length + len(self.generated_token_ids)

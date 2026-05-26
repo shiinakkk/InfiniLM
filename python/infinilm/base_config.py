@@ -62,6 +62,8 @@ class BaseConfig:
         self.attn = self.args.attn
         self.enable_graph = self.args.enable_graph
         self.enable_paged_attn = self.args.enable_paged_attn
+        self.enable_chunked_prefill = self.args.enable_chunked_prefill
+        self.prefill_chunk_size = self.args.prefill_chunk_size
         self.num_blocks = self.args.num_blocks
         self.block_size = self.args.block_size
         self.max_cache_len = self.args.max_cache_len
@@ -108,6 +110,17 @@ class BaseConfig:
         if self.enable_paged_attn and self.attn == "default":
             self.attn = "paged-attn"
 
+        if self.enable_chunked_prefill:
+            if self.cache_type != "paged":
+                raise ValueError(
+                    "--enable-chunked-prefill currently requires --cache-type paged"
+                )
+            if self.prefill_chunk_size <= 0:
+                raise ValueError(
+                    "--prefill-chunk-size must be greater than 0 when "
+                    "--enable-chunked-prefill is set"
+                )
+
     def _add_common_args(self):
         # --- base configuration ---
         self.parser.add_argument("--model", type=str, required=True)
@@ -126,6 +139,17 @@ class BaseConfig:
             "--enable-paged-attn",
             action="store_true",
             help="use paged cache",
+        )
+        self.parser.add_argument(
+            "--enable-chunked-prefill",
+            action="store_true",
+            help="split prompt prefill into chunks for paged KV cache",
+        )
+        self.parser.add_argument(
+            "--prefill-chunk-size",
+            type=int,
+            default=512,
+            help="number of prompt tokens per chunk when chunked prefill is enabled",
         )
         self.parser.add_argument(
             "--num-blocks", type=int, default=512, help="number of KV cache blocks"

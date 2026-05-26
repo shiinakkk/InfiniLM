@@ -168,6 +168,19 @@ def test(
                 for text in input_contents
             ]
 
+    # Optional: fixed prefill length for profiling / mcTracer parity with vLLM bench rows.
+    # Build synthetic token ids of length TRACE_PREFILL_LEN (repeat a short encoded fragment).
+    _trace_prefill_len = os.environ.get("TRACE_PREFILL_LEN")
+    if _trace_prefill_len:
+        n = int(_trace_prefill_len)
+        seed = tokenizer.encode(" benchmark ", add_special_tokens=False)
+        if not seed:
+            seed = [tokenizer.pad_token_id or 0]
+        rep: list[int] = []
+        while len(rep) < n:
+            rep.extend(seed)
+        input_ids_list = [rep[:n]]
+
     # ---------------------------------------------------------------------------- #
     #                       Create KVCache
     # ---------------------------------------------------------------------------- #

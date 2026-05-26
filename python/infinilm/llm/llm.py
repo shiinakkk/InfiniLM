@@ -56,6 +56,8 @@ class EngineConfig:
         enable_graph: Whether to enable graph compiling.
         attn_backend: Attention backend to use ('default', 'flash-attn').
         skip_load: Whether to skip loading model weights (for testing).
+        enable_chunked_prefill: Whether to split prompt prefill into chunks.
+        prefill_chunk_size: Number of prompt tokens per prefill chunk.
     """
 
     model_path: str
@@ -74,6 +76,8 @@ class EngineConfig:
     enable_graph: bool = False
     attn_backend: str = "default"
     skip_load: bool = False
+    enable_chunked_prefill: bool = False
+    prefill_chunk_size: int = 512
 
 
 class LLMEngine:
@@ -121,6 +125,8 @@ class LLMEngine:
                 max_batch_size=config.max_batch_size,
                 num_blocks=config.num_blocks,
                 block_size=config.block_size,
+                enable_chunked_prefill=config.enable_chunked_prefill,
+                prefill_chunk_size=config.prefill_chunk_size,
             )
             logger.info(f"Using Paged KV Cache with num_blocks={config.num_blocks}")
         else:
@@ -191,14 +197,24 @@ class LLMEngine:
         )
 
         # Run inference
-        sampled_tokens = self.model_engine.forward(**model_input)
-        sampled_tokens_list = sampled_tokens.to_numpy().tolist()
+        if getattr(scheduler_output, "use_chunked_prefill", False):
+            sampled_tokens = self.model_engine.forward(
+                **model_input,
+                sample_output=scheduler_output.sample_output,
+            )
+        else:
+            sampled_tokens = self.model_engine.forward(**model_input)
+        sampled_tokens_list = (
+            [] if sampled_tokens is None else sampled_tokens.to_numpy().tolist()
+        )
 
         # Update request status
         pending = self._update_requests(
             scheduler_output.is_prefill,
             scheduler_output.scheduled_requests,
             sampled_tokens_list,
+            scheduler_output.sample_output,
+            scheduler_output.use_chunked_prefill,
         )
 
         return scheduler_output.scheduled_requests, pending
@@ -208,26 +224,54 @@ class LLMEngine:
         is_prefill: bool,
         requests: List[InferenceRequest],
         sampled_tokens: List[int],
+        sample_output: bool = True,
+        use_chunked_prefill: bool = False,
     ) -> List[tuple]:
         """Update request status after inference step."""
         if is_prefill:
-            match self.cache_type:
-                case "paged":
-                    self.scheduler.cache_manager.reset_req_blocks()
-                case "static":
-                    self.scheduler.update_cache()
-                case _:
-                    raise ValueError(f"Unsupported cache_type: {self.cache_type}")
+            if use_chunked_prefill:
+                if self.cache_type != "paged":
+                    raise ValueError("chunked prefill requires paged cache")
+            else:
+                match self.cache_type:
+                    case "paged":
+                        self.scheduler.cache_manager.reset_req_blocks()
+                    case "static":
+                        self.scheduler.update_cache()
+                    case _:
+                        raise ValueError(f"Unsupported cache_type: {self.cache_type}")
         pending = []
-        for req, token_id in zip(requests, sampled_tokens):
+        expects_token = (not is_prefill) or sample_output
+        sampled_token_iter = iter(sampled_tokens)
+
+        for req in requests:
+            token_id = None
+            if expects_token:
+                try:
+                    token_id = next(sampled_token_iter)
+                except StopIteration as exc:
+                    raise RuntimeError(
+                        "sampled token count is smaller than scheduled request count"
+                    ) from exc
+
             if req.is_aborted():
                 logger.info(
                     f"Request {req.request_id} aborted by client, skipping update"
                 )
                 continue
 
-            if req.is_prefill:
+            if use_chunked_prefill and is_prefill:
+                req.mark_prefill_progress(req.prefill_chunk_end)
+                self.scheduler.commit_prefill_progress(req)
+                if not sample_output:
+                    continue
+                if req.is_prefill:
+                    req.is_prefill = False
+            elif req.is_prefill:
                 req.is_prefill = False
+
+            if token_id is None:
+                raise RuntimeError("sampled token is required for request update")
 
             req.generated_token_ids.append(token_id)
             pending_tokens = req.generated_token_ids[req._pending_token_offset :]
@@ -363,6 +407,8 @@ class LLM:
         enable_graph: bool = False,
         attn_backend: str = "default",
         skip_load: bool = False,
+        enable_chunked_prefill: bool = False,
+        prefill_chunk_size: int = 512,
     ):
         """Initialize LLM.
 
@@ -382,6 +428,8 @@ class LLM:
             top_k: Default top-k sampling parameter.
             enable_graph: Whether to enable graph compiling.
             attn_backend: Attention backend to use ('default', 'flash-attn').
+            enable_chunked_prefill: Whether to split prompt prefill into chunks.
+            prefill_chunk_size: Number of prompt tokens per prefill chunk.
         """
         config = EngineConfig(
             model_path=model_path,
@@ -400,6 +448,8 @@ class LLM:
             enable_graph=enable_graph,
             attn_backend=attn_backend,
             skip_load=skip_load,
+            enable_chunked_prefill=enable_chunked_prefill,
+            prefill_chunk_size=prefill_chunk_size,
         )
         self.engine = LLMEngine(config)
         self.config = config
@@ -540,6 +590,8 @@ class AsyncLLMEngine:
         top_k: int = 1,
         enable_graph: bool = False,
         attn_backend: str = "default",
+        enable_chunked_prefill: bool = False,
+        prefill_chunk_size: int = 512,
     ):
         """Initialize AsyncLLMEngine.
 
@@ -559,6 +611,8 @@ class AsyncLLMEngine:
             top_k: Default top-k sampling parameter.
             enable_graph: Whether to enable graph compiling.
             attn_backend: Attention backend to use ('default', 'flash-attn').
+            enable_chunked_prefill: Whether to split prompt prefill into chunks.
+            prefill_chunk_size: Number of prompt tokens per prefill chunk.
         """
         config = EngineConfig(
             model_path=model_path,
@@ -576,6 +630,8 @@ class AsyncLLMEngine:
             top_k=top_k,
             enable_graph=enable_graph,
             attn_backend=attn_backend,
+            enable_chunked_prefill=enable_chunked_prefill,
+            prefill_chunk_size=prefill_chunk_size,
         )
         self.engine = LLMEngine(config)
         self.config = config

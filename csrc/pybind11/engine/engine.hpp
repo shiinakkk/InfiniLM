@@ -110,12 +110,14 @@ inline void bind_infer_engine(py::module &m) {
                 input.temperature = 1.0f;
                 input.top_p = 1.0f;
                 input.top_k = 1;
+                input.sample_output = true;
 
                 // Allowed keyword arguments
                 static const std::unordered_set<std::string> allowed_kwargs = {
                     "temperature",
                     "top_p",
                     "top_k",
+                    "sample_output",
                 };
 
                 for (auto &item : kwargs) {
@@ -132,6 +134,8 @@ inline void bind_infer_engine(py::module &m) {
                         input.top_p = py::cast<float>(item.second);
                     } else if (key == "top_k") {
                         input.top_k = py::cast<int>(item.second);
+                    } else if (key == "sample_output") {
+                        input.sample_output = py::cast<bool>(item.second);
                     }
                 }
 
@@ -161,7 +165,8 @@ inline void bind_infer_engine(py::module &m) {
         .def_readwrite("tgt_sizes", &InferEngine::Input::tgt_sizes)
         .def_readwrite("temperature", &InferEngine::Input::temperature)
         .def_readwrite("top_k", &InferEngine::Input::top_k)
-        .def_readwrite("top_p", &InferEngine::Input::top_p);
+        .def_readwrite("top_p", &InferEngine::Input::top_p)
+        .def_readwrite("sample_output", &InferEngine::Input::sample_output);
 
     py::class_<InferEngine::Output>(infer_engine, "Output")
         .def_readwrite("output_ids", &InferEngine::Output::output_ids, "Output tensor");
