@@ -112,7 +112,7 @@ class InferenceServer:
         attn_backend: str = "default",
         ignore_eos: bool = False,
         enable_chunked_prefill: bool = False,
-        prefill_chunk_size: int = 512,
+        prefill_chunk_size: int = 2048,
         enable_continuous_batching: bool = False,
         max_num_batched_tokens: Optional[int] = None,
     ):

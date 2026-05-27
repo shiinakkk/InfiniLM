@@ -85,7 +85,7 @@ class EngineConfig:
     attn_backend: str = "default"
     skip_load: bool = False
     enable_chunked_prefill: bool = False
-    prefill_chunk_size: int = 512
+    prefill_chunk_size: int = 2048
     enable_continuous_batching: bool = False
     max_num_batched_tokens: Optional[int] = None
 
@@ -454,7 +454,7 @@ class LLM:
         attn_backend: str = "default",
         skip_load: bool = False,
         enable_chunked_prefill: bool = False,
-        prefill_chunk_size: int = 512,
+        prefill_chunk_size: int = 2048,
         enable_continuous_batching: bool = False,
         max_num_batched_tokens: Optional[int] = None,
     ):
@@ -643,7 +643,7 @@ class AsyncLLMEngine:
         enable_graph: bool = False,
         attn_backend: str = "default",
         enable_chunked_prefill: bool = False,
-        prefill_chunk_size: int = 512,
+        prefill_chunk_size: int = 2048,
         enable_continuous_batching: bool = False,
         max_num_batched_tokens: Optional[int] = None,
     ):

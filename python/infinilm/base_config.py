@@ -168,7 +168,7 @@ class BaseConfig:
         self.parser.add_argument(
             "--prefill-chunk-size",
             type=int,
-            default=512,
+            default=2048,
             help="number of prompt tokens per chunk when chunked prefill is enabled",
         )
         self.parser.add_argument(
@@ -180,7 +180,11 @@ class BaseConfig:
             "--max-num-batched-tokens",
             type=int,
             default=None,
-            help="maximum number of prompt/decode tokens scheduled in one step",
+            help=(
+                "maximum number of prompt/decode tokens scheduled in one "
+                "continuous batching step; defaults to 2048 when continuous "
+                "batching is enabled"
+            ),
         )
         self.parser.add_argument(
             "--num-blocks", type=int, default=512, help="number of KV cache blocks"
@@ -208,7 +212,9 @@ class BaseConfig:
             "--max-batch-size",
             type=int,
             default=8,
-            help="maximum batch size for server",
+            help=(
+                "maximum request batch size when continuous batching is disabled"
+            ),
         )
         self.parser.add_argument(
             "--input-len", type=parse_list, default=10, help="input sequence length"

@@ -15,6 +15,7 @@ PHASE_DECODE = "decode"
 PHASE_PREFILL_MIDDLE = "prefill_middle"
 PHASE_PREFILL_LAST = "prefill_last"
 PREFILL_PHASES = {PHASE_PREFILL_MIDDLE, PHASE_PREFILL_LAST}
+DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048
 
 
 class SchedulerOutput:
@@ -79,7 +80,7 @@ class Scheduler:
         num_blocks: int = 512,
         block_size: int = 256,
         enable_chunked_prefill: bool = False,
-        prefill_chunk_size: int = 512,
+        prefill_chunk_size: int = 2048,
         enable_continuous_batching: bool = False,
         max_num_batched_tokens: Optional[int] = None,
     ):
@@ -98,7 +99,8 @@ class Scheduler:
         self.enable_continuous_batching = enable_continuous_batching
         self.max_num_batched_tokens = max_num_batched_tokens
         if self.enable_continuous_batching and self.max_num_batched_tokens is None:
-            self.max_num_batched_tokens = self.max_batch_size * self.prefill_chunk_size
+            self.max_num_batched_tokens = DEFAULT_MAX_NUM_BATCHED_TOKENS
+        self._prefill_rr_next_source = "running"
 
         self.cache_manager = BlockManager(num_blocks=num_blocks, block_size=block_size)
         self.block_size = block_size
@@ -295,14 +297,7 @@ class Scheduler:
             input_ranges,
             used_tokens,
         )
-        used_tokens = self._schedule_running_prefill_requests(
-            scheduled_requests,
-            request_phases,
-            sample_mask,
-            input_ranges,
-            used_tokens,
-        )
-        self._schedule_waiting_prefill_requests(
+        self._schedule_prefill_round_robin_requests(
             scheduled_requests,
             request_phases,
             sample_mask,
@@ -333,8 +328,6 @@ class Scheduler:
     ) -> int:
         running_queue_size = self.running_queue.sync_q.qsize()
         for _ in range(running_queue_size):
-            if self._batch_is_full(scheduled_requests):
-                break
             if not self._fits_token_budget(1, used_tokens, bool(scheduled_requests)):
                 break
 
@@ -371,7 +364,7 @@ class Scheduler:
 
         return used_tokens
 
-    def _schedule_running_prefill_requests(
+    def _schedule_prefill_round_robin_requests(
         self,
         scheduled_requests: List[InferenceRequest],
         request_phases: List[str],
@@ -379,19 +372,63 @@ class Scheduler:
         input_ranges: List[Optional[tuple[int, int]]],
         used_tokens: int,
     ) -> int:
-        running_queue_size = self.running_queue.sync_q.qsize()
-        for _ in range(running_queue_size):
-            if self._batch_is_full(scheduled_requests):
-                break
+        """Schedule prefill chunks with round-robin fairness across requests."""
+        failed_sources = set()
 
+        while True:
             remaining_budget = self._remaining_token_budget(used_tokens)
             if remaining_budget is not None and remaining_budget <= 0:
                 break
 
+            source = self._prefill_rr_next_source
+            if source == "running":
+                chunk_len = self._schedule_one_running_prefill_request(
+                    scheduled_requests,
+                    request_phases,
+                    sample_mask,
+                    input_ranges,
+                    used_tokens,
+                )
+                self._prefill_rr_next_source = "waiting"
+            else:
+                chunk_len = self._schedule_one_waiting_prefill_request(
+                    scheduled_requests,
+                    request_phases,
+                    sample_mask,
+                    input_ranges,
+                    used_tokens,
+                )
+                self._prefill_rr_next_source = "running"
+
+            if chunk_len is None:
+                failed_sources.add(source)
+                if len(failed_sources) >= 2:
+                    break
+                continue
+
+            failed_sources.clear()
+            used_tokens += chunk_len
+
+        return used_tokens
+
+    def _schedule_one_running_prefill_request(
+        self,
+        scheduled_requests: List[InferenceRequest],
+        request_phases: List[str],
+        sample_mask: List[bool],
+        input_ranges: List[Optional[tuple[int, int]]],
+        used_tokens: int,
+    ) -> Optional[int]:
+        running_queue_size = self.running_queue.sync_q.qsize()
+        for _ in range(running_queue_size):
+            remaining_budget = self._remaining_token_budget(used_tokens)
+            if remaining_budget is not None and remaining_budget <= 0:
+                return None
+
             try:
                 req = self.running_queue.sync_q.get_nowait()
             except queue.Empty:
-                break
+                return None
 
             if req.is_finished():
                 self.complete_requests([req])
@@ -406,39 +443,36 @@ class Scheduler:
             )
             if chunk_len <= 0:
                 self.running_queue.sync_q.put(req)
-                break
+                continue
 
-            req.status = RequestStatus.RUNNING
-            scheduled_requests.append(req)
-            phase = (
-                PHASE_PREFILL_LAST
-                if req.should_sample_current_step()
-                else PHASE_PREFILL_MIDDLE
+            self._append_prefill_schedule(
+                req,
+                scheduled_requests,
+                request_phases,
+                sample_mask,
+                input_ranges,
             )
-            request_phases.append(phase)
-            sample_mask.append(req.should_sample_current_step())
-            input_ranges.append((req.prefill_chunk_start, req.prefill_chunk_end))
-            used_tokens += chunk_len
+            return chunk_len
 
-        return used_tokens
+        return None
 
-    def _schedule_waiting_prefill_requests(
+    def _schedule_one_waiting_prefill_request(
         self,
         scheduled_requests: List[InferenceRequest],
         request_phases: List[str],
         sample_mask: List[bool],
         input_ranges: List[Optional[tuple[int, int]]],
         used_tokens: int,
-    ) -> int:
-        while not self._batch_is_full(scheduled_requests):
+    ) -> Optional[int]:
+        while True:
             remaining_budget = self._remaining_token_budget(used_tokens)
             if remaining_budget is not None and remaining_budget <= 0:
-                break
+                return None
 
             try:
                 req = self.waiting_queue.sync_q.get_nowait()
             except queue.Empty:
-                break
+                return None
 
             if req.is_finished():
                 self.complete_requests([req])
@@ -448,7 +482,7 @@ class Scheduler:
                 req, additional_requests=scheduled_requests
             ):
                 self.waiting_queue.sync_q.put(req)
-                break
+                return None
 
             self._initialize_chunked_prefill_cache(req)
             chunk_len = self._prepare_chunked_prefill_request(
@@ -456,21 +490,37 @@ class Scheduler:
             )
             if chunk_len <= 0:
                 self.waiting_queue.sync_q.put(req)
-                break
+                return None
 
-            req.status = RequestStatus.RUNNING
-            scheduled_requests.append(req)
-            phase = (
-                PHASE_PREFILL_LAST
-                if req.should_sample_current_step()
-                else PHASE_PREFILL_MIDDLE
+            self._append_prefill_schedule(
+                req,
+                scheduled_requests,
+                request_phases,
+                sample_mask,
+                input_ranges,
             )
-            request_phases.append(phase)
-            sample_mask.append(req.should_sample_current_step())
-            input_ranges.append((req.prefill_chunk_start, req.prefill_chunk_end))
-            used_tokens += chunk_len
+            return chunk_len
 
-        return used_tokens
+        return None
+
+    def _append_prefill_schedule(
+        self,
+        req: InferenceRequest,
+        scheduled_requests: List[InferenceRequest],
+        request_phases: List[str],
+        sample_mask: List[bool],
+        input_ranges: List[Optional[tuple[int, int]]],
+    ) -> None:
+        req.status = RequestStatus.RUNNING
+        scheduled_requests.append(req)
+        phase = (
+            PHASE_PREFILL_LAST
+            if req.should_sample_current_step()
+            else PHASE_PREFILL_MIDDLE
+        )
+        request_phases.append(phase)
+        sample_mask.append(req.should_sample_current_step())
+        input_ranges.append((req.prefill_chunk_start, req.prefill_chunk_end))
 
     def _batch_is_full(self, scheduled_requests: List[InferenceRequest]) -> bool:
         return len(scheduled_requests) >= self.max_batch_size
@@ -563,7 +613,7 @@ class Scheduler:
             return 0
 
         req.mark_prefill_chunk(start, end)
-        logger.info(
+        logger.debug(
             "chunked prefill request=%s chunk=[%d,%d) sample_output=%s",
             req.request_id[:8],
             start,
