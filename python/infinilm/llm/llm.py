@@ -140,7 +140,19 @@ class LLMEngine:
                 enable_continuous_batching=config.enable_continuous_batching,
                 max_num_batched_tokens=config.max_num_batched_tokens,
             )
-            logger.info(f"Using Paged KV Cache with num_blocks={config.num_blocks}")
+            logger.info(
+                "Using Paged KV Cache with num_blocks=%s block_size=%s "
+                "max_batch_size=%s enable_chunked_prefill=%s "
+                "prefill_chunk_size=%s enable_continuous_batching=%s "
+                "max_num_batched_tokens=%s",
+                config.num_blocks,
+                config.block_size,
+                config.max_batch_size,
+                config.enable_chunked_prefill,
+                config.prefill_chunk_size,
+                config.enable_continuous_batching,
+                config.max_num_batched_tokens,
+            )
         else:
             raise ValueError(f"Unsupported cache_type: {config.cache_type}")
 
@@ -195,10 +207,12 @@ class LLMEngine:
             - scheduled_requests: Requests that were scheduled and processed in this step.
             - pending: Pending streaming outputs as (async_queue, TokenOutput) pairs.
         """
+        step_start = time.perf_counter()
         # Schedule requests
         scheduler_output = self.scheduler.schedule()
         if scheduler_output is None or not scheduler_output.scheduled_requests:
             return [], []
+        schedule_end = time.perf_counter()
 
         # Build model inputs
         model_input = self.processor.build_model_inputs(
@@ -207,6 +221,7 @@ class LLMEngine:
             self.config.top_p,
             self.config.top_k,
         )
+        build_end = time.perf_counter()
 
         # Run inference. Continuous batching uses per-request sampling, where
         # output_ids is compacted in scheduled request order for sample_mask=True.
@@ -228,12 +243,34 @@ class LLMEngine:
             )
         else:
             sampled_tokens = self.model_engine.forward(**model_input)
+        forward_end = time.perf_counter()
         sampled_tokens_list = (
             [] if sampled_tokens is None else sampled_tokens.to_numpy().tolist()
         )
 
         # Update request status
         pending = self._update_requests(scheduler_output, sampled_tokens_list)
+        update_end = time.perf_counter()
+        if logger.isEnabledFor(logging.DEBUG):
+            input_ranges = getattr(scheduler_output, "input_ranges", [])
+            scheduled_tokens = 0
+            for input_range in input_ranges:
+                if input_range is None:
+                    scheduled_tokens += 1
+                else:
+                    start, end = input_range
+                    scheduled_tokens += end - start
+            logger.debug(
+                "engine step requests=%d tokens=%d sampled=%d timings_ms schedule=%.2f build=%.2f forward=%.2f update=%.2f total=%.2f",
+                len(scheduler_output.scheduled_requests),
+                scheduled_tokens,
+                len(sampled_tokens_list),
+                (schedule_end - step_start) * 1000,
+                (build_end - schedule_end) * 1000,
+                (forward_end - build_end) * 1000,
+                (update_end - forward_end) * 1000,
+                (update_end - step_start) * 1000,
+            )
 
         return scheduler_output.scheduled_requests, pending
 
@@ -320,6 +357,8 @@ class LLMEngine:
                 raise RuntimeError("sampled token is required for request update")
 
             req.generated_token_ids.append(token_id)
+            if req.get_num_generated_tokens() == 1:
+                logger.debug("first token ready request=%s", req.request_id[:8])
             pending_tokens = req.generated_token_ids[req._pending_token_offset :]
             delta = self.tokenizer.decode(pending_tokens)
             holds_back = bool(delta) and delta.endswith("\ufffd")
@@ -371,7 +410,7 @@ class LLMEngine:
                         f"Request {req.request_id} aborted before putting token"
                     )
                     continue
-                pending.append((req.output_queue.async_q, output))
+                pending.append((req.output_queue, output))
 
         self.scheduler.complete_requests(requests)
         return pending
@@ -550,11 +589,15 @@ class LLM:
                 )
 
                 images, videos, audios = resolve_multimodal_inputs(content)
-                processed_inputs = self.engine.process(
-                    prompt, images, videos, audios, return_tensors="pt"
-                )
-
-                prompt_token_ids = processed_inputs.get("input_ids").flatten().tolist()
+                if images or videos or audios:
+                    processed_inputs = self.engine.process(
+                        prompt, images, videos, audios, return_tensors="pt"
+                    )
+                    prompt_token_ids = (
+                        processed_inputs.get("input_ids").flatten().tolist()
+                    )
+                else:
+                    prompt_token_ids = self.engine.tokenize(prompt)
             else:
                 prompt = content
                 prompt_token_ids = self.engine.tokenize(prompt)
@@ -735,7 +778,11 @@ class AsyncLLMEngine:
                 if not requests:
                     time.sleep(0.01)
                 elif pending:
-                    self._loop.call_soon_threadsafe(self._batch_put, pending)
+                    self._batch_put(pending)
+                    # Give the asyncio loop a chance to flush streamed tokens.
+                    # Without this, the step thread can keep scheduling GPU work
+                    # and delay TTFT under high concurrency.
+                    time.sleep(0)
             except Exception as e:
                 logger.error(f"Error in step loop: {e}", exc_info=True)
                 self._healthy = False
@@ -744,9 +791,9 @@ class AsyncLLMEngine:
 
     @staticmethod
     def _batch_put(pending):
-        for async_q, output in pending:
+        for output_queue, output in pending:
             try:
-                async_q.put_nowait(output)
+                output_queue.sync_q.put_nowait(output)
             except Exception as e:
                 logger.warning(
                     f"Failed to put token for request {output.request_id}: {e}. "
@@ -823,11 +870,13 @@ class AsyncLLMEngine:
             )
 
             images, videos, audios = resolve_multimodal_inputs(messages)
-            processed_inputs = self.engine.process(
-                prompt, images, videos, audios, return_tensors="pt"
-            )
-
-            prompt_token_ids = processed_inputs.get("input_ids").flatten().tolist()
+            if images or videos or audios:
+                processed_inputs = self.engine.process(
+                    prompt, images, videos, audios, return_tensors="pt"
+                )
+                prompt_token_ids = processed_inputs.get("input_ids").flatten().tolist()
+            else:
+                prompt_token_ids = self.engine.tokenize(prompt)
 
         if sampling_params is None:
             sampling_params = SamplingParams(max_tokens=self.config.max_tokens)

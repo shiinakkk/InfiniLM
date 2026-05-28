@@ -104,6 +104,18 @@ class Scheduler:
 
         self.cache_manager = BlockManager(num_blocks=num_blocks, block_size=block_size)
         self.block_size = block_size
+        logger.info(
+            "Scheduler initialized max_batch_size=%s num_blocks=%s block_size=%s "
+            "enable_chunked_prefill=%s prefill_chunk_size=%s "
+            "enable_continuous_batching=%s max_num_batched_tokens=%s",
+            self.max_batch_size,
+            num_blocks,
+            block_size,
+            self.enable_chunked_prefill,
+            self.prefill_chunk_size,
+            self.enable_continuous_batching,
+            self.max_num_batched_tokens,
+        )
 
     def add_request(self, request: InferenceRequest):
         if request is not None:
@@ -307,6 +319,24 @@ class Scheduler:
 
         if not scheduled_requests:
             return None
+
+        scheduled_tokens = self._count_scheduled_tokens(input_ranges)
+        if (
+            self.max_num_batched_tokens is not None
+            and scheduled_tokens > self.max_num_batched_tokens
+        ):
+            raise RuntimeError(
+                "continuous scheduler exceeded max_num_batched_tokens: "
+                f"scheduled={scheduled_tokens}, limit={self.max_num_batched_tokens}, "
+                f"phases={request_phases}, ranges={input_ranges}"
+            )
+        logger.debug(
+            "continuous schedule requests=%d tokens=%d phases=%s ranges=%s",
+            len(scheduled_requests),
+            scheduled_tokens,
+            request_phases,
+            input_ranges,
+        )
 
         return SchedulerOutput(
             scheduled_requests=scheduled_requests,
@@ -529,6 +559,19 @@ class Scheduler:
         if self.max_num_batched_tokens is None:
             return None
         return self.max_num_batched_tokens - used_tokens
+
+    @staticmethod
+    def _count_scheduled_tokens(
+        input_ranges: List[Optional[tuple[int, int]]],
+    ) -> int:
+        total = 0
+        for item in input_ranges:
+            if item is None:
+                total += 1
+                continue
+            start, end = item
+            total += end - start
+        return total
 
     def _fits_token_budget(
         self,

@@ -356,12 +356,15 @@ class InferenceServer:
     async def _stream_chat(self, request_id: str, data: dict, http_request: Request):
         """Handle streaming chat request."""
         req = None
+        stream_start = time.perf_counter()
+        first_token_yielded = False
 
         try:
             messages = data.get("messages", [])
             sampling_params = self._build_sampling_params(data)
 
-            req = self.engine.add_chat_request(
+            req = await asyncio.to_thread(
+                self.engine.add_chat_request,
                 messages=messages,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -369,6 +372,12 @@ class InferenceServer:
                 http_request=http_request,
                 add_generation_prompt=bool(data.get("add_generation_prompt", True)),
                 chat_template_kwargs=data.get("chat_template_kwargs") or {},
+            )
+            logger.debug(
+                "stream request enqueued request=%s prompt_tokens=%d enqueue_ms=%.2f",
+                request_id[:8],
+                req.prompt_length,
+                (time.perf_counter() - stream_start) * 1000,
             )
 
             async for token_output in self.engine.stream_request(
@@ -409,6 +418,13 @@ class InferenceServer:
                 )
 
                 if not is_eos_token and token_output.token_text:
+                    if not first_token_yielded:
+                        first_token_yielded = True
+                        logger.debug(
+                            "first token yield request=%s elapsed_ms=%.2f",
+                            request_id[:8],
+                            (time.perf_counter() - stream_start) * 1000,
+                        )
                     # Send token
                     chunk = json.dumps(
                         chunk_json(
@@ -469,7 +485,8 @@ class InferenceServer:
             messages = data.get("messages", [])
             sampling_params = self._build_sampling_params(data)
 
-            req = self.engine.add_chat_request(
+            req = await asyncio.to_thread(
+                self.engine.add_chat_request,
                 messages=messages,
                 sampling_params=sampling_params,
                 request_id=request_id,
